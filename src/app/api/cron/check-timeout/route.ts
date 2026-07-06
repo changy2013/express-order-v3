@@ -5,8 +5,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 60;
 
 /**
- * Vercel Cron Job: */15 * * * *
- * 每 15 分钟扫描超时工单并自动处理
+ * Vercel Cron Job — every 15 minutes
+ * 扫描超时工单并自动处理
  */
 export async function GET() {
   try {
