@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
+import Link from 'next/link';
 
 export default function CompensationPage() {
   const [records, setRecords] = useState<any[]>([]);
@@ -36,14 +37,14 @@ export default function CompensationPage() {
     <div className="main-content">
       <div className="card">
         <div className="card-header">
-          <h2>💰 赔付记录</h2>
+          <h2>💰 赔付与追偿记录</h2>
           <div className="form-group" style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 0 }}>
-            <label className="form-label" style={{ marginBottom: 0 }}>赔付方向:</label>
+            <label className="form-label" style={{ marginBottom: 0 }}>类型筛选:</label>
             <select className="form-input" value={filterDirection}
               onChange={e => { setFilterDirection(e.target.value); setPage(1); }} style={{ width: 150 }}>
               <option value="">全部</option>
-              <option value="to_customer">赔付客户</option>
-              <option value="to_supplier">向供应商追偿</option>
+              <option value="to_customer">赔付客户 (货损理赔)</option>
+              <option value="to_supplier">向供应商追偿 (来货异常)</option>
             </select>
           </div>
         </div>
@@ -52,13 +53,13 @@ export default function CompensationPage() {
           <div className="stat-grid" style={{ marginBottom: 20 }}>
             {stats.length > 0 ? stats.map((s: any) => (
               <div key={s.compensation_direction} className="stat-card">
-                <div className="stat-icon" style={{ background: s.compensation_direction === 'to_customer' ? '#f6ffed' : '#e6f7ff' }}>
-                  {s.compensation_direction === 'to_customer' ? '💰' : '📤'}
+                <div className="stat-icon" style={{ background: s.compensation_direction === 'to_customer' ? '#fff1f0' : '#e6f7ff' }}>
+                  {s.compensation_direction === 'to_customer' ? '💸' : '📥'}
                 </div>
                 <div className="stat-info">
                   <div className="stat-value">¥{Number(s.total_amount).toFixed(2)}</div>
                   <div className="stat-label">
-                    {s.compensation_direction === 'to_customer' ? '赔付客户' : '向供应商追偿'} ({s.count} 笔)
+                    {s.compensation_direction === 'to_customer' ? '赔付客户 (理赔支出)' : '向供应商追偿 (追偿收入)'} ({s.count} 笔)
                   </div>
                 </div>
               </div>
@@ -81,6 +82,7 @@ export default function CompensationPage() {
                     <th>运单号</th>
                     <th>赔付方向</th>
                     <th>金额</th>
+                    <th>来源审批记录 ID (可追溯)</th>
                     <th>状态</th>
                     <th>备注</th>
                     <th>创建时间</th>
@@ -89,21 +91,38 @@ export default function CompensationPage() {
                 <tbody>
                   {records.map(r => (
                     <tr key={r.id}>
-                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{r.ticket_no}</td>
+                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                        {r.ticket_no ? (
+                          <Link href={`/tickets/${r.ticket_id}`} style={{ color: '#0fc6c2' }}>
+                            {r.ticket_no}
+                          </Link>
+                        ) : '-'}
+                      </td>
                       <td>{r.waybill_no}</td>
                       <td>
-                        <span className={`tag ${r.compensation_direction === 'to_customer' ? 'tag-success' : 'tag-info'}`}>
-                          {r.compensation_direction === 'to_customer' ? '赔付客户' : '向供应商追偿'}
+                        <span className={`tag ${r.compensation_direction === 'to_customer' ? 'tag-error' : 'tag-success'}`} style={{ color: r.compensation_direction === 'to_customer' ? '#cf1322' : '#389e0d' }}>
+                          {r.compensation_direction === 'to_customer' ? '赔付给客户' : '向供应商追偿'}
                         </span>
                       </td>
-                      <td style={{ fontWeight: 600 }}>¥{Number(r.amount).toFixed(2)}</td>
+                      <td style={{ fontWeight: 600, color: r.compensation_direction === 'to_customer' ? '#cf1322' : '#389e0d' }}>
+                        {r.compensation_direction === 'to_customer' ? '-' : '+'}$ {Number(r.amount).toFixed(2)}
+                      </td>
+                      <td>
+                        {r.approval_record_id ? (
+                          <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#666' }} title={r.approval_record_id}>
+                            {r.approval_record_id.slice(0, 8)}...{r.approval_record_id.slice(-8)}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#999', fontSize: 12 }}>自动执行 / 未关联</span>
+                        )}
+                      </td>
                       <td><span className="tag-warning tag">{r.status}</span></td>
                       <td style={{ maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.remark || '-'}</td>
                       <td style={{ fontSize: 12 }}>{new Date(r.created_at).toLocaleString('zh-CN')}</td>
                     </tr>
                   ))}
                   {records.length === 0 && (
-                    <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40, color: '#999' }}>暂无赔付记录</td></tr>
+                    <tr><td colSpan={8} style={{ textAlign: 'center', padding: 40, color: '#999' }}>暂无赔付记录</td></tr>
                   )}
                 </tbody>
               </table>

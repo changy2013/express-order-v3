@@ -155,12 +155,44 @@ CREATE TABLE IF NOT EXISTS inventory (
 );
 CREATE INDEX IF NOT EXISTS idx_inv_sku ON inventory(sku_code);
 
+-- 库存变动日志表（可追溯性：记录每次变动由哪条审批记录触发）
+CREATE TABLE IF NOT EXISTS inventory_logs (
+  id VARCHAR(36) PRIMARY KEY,
+  sku_code VARCHAR(100) NOT NULL,
+  warehouse VARCHAR(100) DEFAULT 'default',
+  change_type VARCHAR(50) NOT NULL CHECK (change_type IN ('lock', 'unlock', 'deduct', 'add', 'adjust')),
+  qty_change INTEGER NOT NULL,
+  qty_before INTEGER NOT NULL,
+  qty_after INTEGER NOT NULL,
+  reason TEXT,
+  ticket_id VARCHAR(36),
+  approval_record_id VARCHAR(36),
+  operator VARCHAR(100),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_il_sku ON inventory_logs(sku_code);
+CREATE INDEX IF NOT EXISTS idx_il_ticket ON inventory_logs(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_il_approval ON inventory_logs(approval_record_id);
+CREATE INDEX IF NOT EXISTS idx_il_created ON inventory_logs(created_at DESC);
+
 -- ============================================================
 -- 初始配置数据
 -- ============================================================
 INSERT INTO approval_configs (id, config_key, config_value, description) VALUES
-  (gen_random_uuid()::varchar, 'approval_level_thresholds', '{"level1_max_amount": 5000, "level2_min_amount": 5000.01}', '分级审批金额阈值（元）'),
-  (gen_random_uuid()::varchar, 'approval_timeout_hours', '{"level1": 48, "level2": 24}', '审批超时时长（小时）'),
-  (gen_random_uuid()::varchar, 'qc_hold_timeout_minutes', '{"qc_hold": 120}', '品控暂扣超时时长（分钟）'),
-  (gen_random_uuid()::varchar, 'reject_max_retries', '{"max_retries": 3}', '拒绝重提次数上限')
+  (gen_random_uuid()::varchar, 'approval_level_thresholds', '{"level1_max_amount": 5000, "level2_min_amount": 5000.01}', '分级审批金额阈值（元）：5000元以下一级审批，5000元及以上需二级审批'),
+  (gen_random_uuid()::varchar, 'approval_timeout_hours', '{"level1": 48, "level2": 24}', '审批超时时长（小时）：一级48小时，二级24小时，超时自动升级'),
+  (gen_random_uuid()::varchar, 'qc_hold_timeout_minutes', '{"qc_hold": 120}', '品控暂扣超时时长（分钟）：2小时，独立于审批超时，货物压仓成本驱动'),
+  (gen_random_uuid()::varchar, 'reject_max_retries', '{"max_retries": 3}', '拒绝重提次数上限：3次，超出后自动关闭工单')
 ON CONFLICT (config_key) DO NOTHING;
+
+-- 品控规则初始数据（可配置，非硬编码）
+INSERT INTO qc_rules (id, name, description, exception_type, trigger_conditions, severity, auto_create_ticket, target_approval_level, enabled) VALUES
+  (gen_random_uuid()::varchar, '数量差异检测', '扫描数量与预期数量差异超过10%触发', '数量不符',
+   '{"qty_diff_percent": 10}', 'high', true, 'level2', true),
+  (gen_random_uuid()::varchar, '破损等级检测', '破损等级达到2级及以上触发（0=无损，5=完全损毁）', '外观破损',
+   '{"damage_level": 2}', 'high', true, 'level2', true),
+  (gen_random_uuid()::varchar, '规格不符检测', '货物规格与运单不匹配触发', '规格不符',
+   '{"spec_mismatch": true}', 'medium', true, 'level1', true),
+  (gen_random_uuid()::varchar, '批次号缺失检测', '扫描时未提供批次号触发', '批次异常',
+   '{"batch_check": true}', 'low', true, 'level1', true)
+ON CONFLICT DO NOTHING;

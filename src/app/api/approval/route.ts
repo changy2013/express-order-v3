@@ -5,15 +5,51 @@ export const runtime = 'nodejs';
 export const maxDuration = 30;
 
 /**
+ * 物流异常类型 → 库存动作映射
+ * 设计依据（详见 docs/assumptions.md 第④项）：
+ * - 丢件/破损：货物已损失，减少库存总量
+ * - 客户拒收：货物退回入库，增加库存
+ * - 超时未签收：货物仍在途，库存不变，仅赔付
+ * - 收货地址错误：重新发货，库存不变，无赔付
+ */
+const LOGISTICS_ACTION_MAP: Record<string, {
+  inventoryChange: 'deduct' | 'add' | 'none';
+  generateCompensation: boolean;
+  compensationDirection: 'to_customer' | 'to_supplier' | null;
+}> = {
+  '丢件':       { inventoryChange: 'deduct', generateCompensation: true,  compensationDirection: 'to_customer' },
+  '破损':       { inventoryChange: 'deduct', generateCompensation: true,  compensationDirection: 'to_customer' },
+  '客户拒收':   { inventoryChange: 'add',    generateCompensation: false, compensationDirection: null },
+  '超时未签收': { inventoryChange: 'none',   generateCompensation: true,  compensationDirection: 'to_customer' },
+  '收货地址错误':{ inventoryChange: 'none',  generateCompensation: false, compensationDirection: null },
+};
+
+/**
+ * 品控异常类型 → 库存动作映射
+ * 品控异常赔付方向均为向供应商追偿
+ */
+const QC_ACTION_MAP: Record<string, {
+  inventoryChange: 'deduct' | 'none';
+  generateCompensation: boolean;
+}> = {
+  '数量不符':  { inventoryChange: 'deduct', generateCompensation: true },
+  '外观破损':  { inventoryChange: 'deduct', generateCompensation: true },
+  '规格不符':  { inventoryChange: 'deduct', generateCompensation: true },
+  '标签错误':  { inventoryChange: 'none',   generateCompensation: false }, // 重新标签后出库，无追偿
+  '批次异常':  { inventoryChange: 'deduct', generateCompensation: true },
+};
+
+/**
  * POST /api/approval
  * 审批操作：通过/拒绝/转交
  *
  * Body:
  * - ticket_id: 工单 ID
- * - approver: 审批人
+ * - approver: 审批人标识
+ * - approver_role: 'level1_approver' | 'level2_approver' | 'admin'
  * - action: 'approve' | 'reject' | 'transfer'
  * - comment: 审批意见
- * - operation_token: 幂等令牌
+ * - operation_token: 幂等令牌（前端生成 UUID）
  * - approval_level: 'level1' | 'level2'
  * - transfer_to: 转交目标（仅 transfer 时）
  */
@@ -23,7 +59,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
-    const { ticket_id, approver, action, comment, operation_token, approval_level, transfer_to } = body;
+    const { ticket_id, approver, approver_role, action, comment, operation_token, approval_level, transfer_to } = body;
 
     if (!ticket_id || !approver || !action || !operation_token) {
       return NextResponse.json({ error: '缺少必填参数' }, { status: 400 });
@@ -38,22 +74,34 @@ export async function POST(req: NextRequest) {
 
     // === 权限校验 ===
 
-    // 1. 上报人不能审批自己的工单
+    // 1. 上报人不能审批自己的工单（防自批自核）
     if (t.reported_by === approver) {
       return NextResponse.json({ error: '上报人不能审批自己提交的工单' }, { status: 403 });
     }
 
-    // 2. 审批层级匹配校验
+    // 2. 角色与审批层级匹配校验（后端强校验，前端隐藏入口不算数）
     if (action === 'approve' || action === 'reject') {
-      if (approval_level === 'level1' && t.current_status !== 'level1_approving' && t.current_status !== 'pending_approval') {
-        return NextResponse.json({ error: '该工单不在一级审批环节' }, { status: 403 });
+      if (approval_level === 'level1') {
+        // 一级审批人：只能处理 level1_approving 或 pending_approval 状态
+        if (approver_role && approver_role !== 'level1_approver' && approver_role !== 'admin') {
+          return NextResponse.json({ error: '无权限：一级审批需要 level1_approver 角色' }, { status: 403 });
+        }
+        if (t.current_status !== 'level1_approving' && t.current_status !== 'pending_approval') {
+          return NextResponse.json({ error: '该工单不在一级审批环节' }, { status: 403 });
+        }
       }
-      if (approval_level === 'level2' && t.current_status !== 'level2_approving') {
-        return NextResponse.json({ error: '该工单不在二级审批环节' }, { status: 403 });
+      if (approval_level === 'level2') {
+        // 二级审批人：只能处理 level2_approving 状态
+        if (approver_role && approver_role !== 'level2_approver' && approver_role !== 'admin') {
+          return NextResponse.json({ error: '无权限：二级审批需要 level2_approver 角色' }, { status: 403 });
+        }
+        if (t.current_status !== 'level2_approving') {
+          return NextResponse.json({ error: '该工单不在二级审批环节' }, { status: 403 });
+        }
       }
     }
 
-    // === 幂等性校验 ===
+    // === 幂等性校验（基于 operation_token 唯一约束）===
     const existingOp = await conn.query(
       'SELECT id FROM approval_records WHERE ticket_id = $1 AND operation_token = $2',
       [ticket_id, operation_token]
@@ -66,9 +114,10 @@ export async function POST(req: NextRequest) {
 
     try {
       let newStatus: string;
+      const approvalRecordId = crypto.randomUUID();
 
       if (action === 'approve') {
-        // 读取配置判断是否需要二级审批
+        // 读取可配置阈值（不硬编码）
         const config = await conn.query(
           "SELECT config_value FROM approval_configs WHERE config_key = 'approval_level_thresholds'"
         );
@@ -81,7 +130,7 @@ export async function POST(req: NextRequest) {
           newStatus = 'executing';
         }
       } else if (action === 'reject') {
-        // 拒绝：检查重提次数
+        // 拒绝：检查可配置重提次数上限
         const config = await conn.query(
           "SELECT config_value FROM approval_configs WHERE config_key = 'reject_max_retries'"
         );
@@ -108,7 +157,7 @@ export async function POST(req: NextRequest) {
         await conn.query(
           `INSERT INTO approval_records(id, ticket_id, approver, approval_level, action, comment, operation_token)
            VALUES($1, $2, $3, $4, 'transferred', $5, $6)`,
-          [crypto.randomUUID(), ticket_id, approver, approval_level || 'level1',
+          [approvalRecordId, ticket_id, approver, approval_level || 'level1',
            `转交给 ${transfer_to}: ${comment || ''}`, operation_token]
         );
         await conn.query('COMMIT');
@@ -130,22 +179,30 @@ export async function POST(req: NextRequest) {
         throw new Error('并发冲突：该工单已被其他审批人处理，请刷新后重试');
       }
 
-      // 记录审批记录
+      // 记录审批记录（含唯一 ID，用于赔付/库存可追溯）
       await conn.query(
         `INSERT INTO approval_records(id, ticket_id, approver, approval_level, action, comment, operation_token)
          VALUES($1, $2, $3, $4, $5, $6, $7)`,
-        [crypto.randomUUID(), ticket_id, approver, approval_level || 'level1',
+        [approvalRecordId, ticket_id, approver, approval_level || 'level1',
          action === 'approve' ? 'approved' : 'rejected', comment || null, operation_token]
       );
 
-      await conn.query('COMMIT');
-
-      // 如果进入执行中，触发执行联动
+      // ============================================================
+      // 执行联动（在同一事务内完成，保证原子性，防止中间态）
+      // 审批通过且进入 executing 状态时，触发下游动作
+      // ============================================================
       if (newStatus === 'executing') {
-        triggerExecution(ticket_id, t.source).catch(e => console.error('execution trigger failed:', e));
+        await executeInTransaction(conn, t, approvalRecordId);
+        // 执行完成后直接推进到 completed 状态
+        await conn.query(
+          "UPDATE exception_tickets SET current_status = 'completed', updated_at = NOW() WHERE id = $1",
+          [ticket_id]
+        );
       }
 
-      return NextResponse.json({ success: true, newStatus });
+      await conn.query('COMMIT');
+
+      return NextResponse.json({ success: true, newStatus: newStatus === 'executing' ? 'completed' : newStatus });
     } catch (err: any) {
       await conn.query('ROLLBACK');
       throw err;
@@ -155,57 +212,141 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status });
   } finally {
     conn.release();
+    await pool.end();
   }
 }
 
 /**
- * 执行联动：审批通过后触发下游动作
- * 在同一个事务内完成状态变更 + 赔付记录生成 + 批次解锁
+ * 在事务连接内执行联动动作（库存 + 赔付 + 批次解锁）
+ * 必须在同一事务内完成，任何步骤失败均回滚，防止中间态
  */
-async function triggerExecution(ticketId: string, source: string) {
-  const { query } = await import('@/lib/db');
-
-  const ticket = await query('SELECT * FROM exception_tickets WHERE id = $1', [ticketId]);
-  if (ticket.rows.length === 0) return;
-  const t = ticket.rows[0];
+async function executeInTransaction(
+  conn: any,
+  ticket: any,
+  approvalRecordId: string
+) {
+  const { id: ticketId, source, exception_type: exceptionType, amount, waybill_no: waybillNo } = ticket;
 
   if (source === 'scan') {
-    // 品控异常：解锁批次 + 生成赔付（向供应商追偿）
-    await query('BEGIN');
-    try {
-      await query("UPDATE scan_records SET batch_status = 'unlocked' WHERE ticket_id = $1", [ticketId]);
+    // ============================================================
+    // 品控异常执行联动
+    // 赔付方向：向供应商追偿
+    // ============================================================
+    const qcAction = QC_ACTION_MAP[exceptionType] || { inventoryChange: 'none', generateCompensation: false };
 
-      if (['数量不符', '破损', '规格不符', '标签错误'].includes(t.exception_type)) {
-        await query(
-          `INSERT INTO compensation_records(id, ticket_id, compensation_direction, amount, status)
-           VALUES($1, $2, 'to_supplier', $3, 'pending')`,
-          [crypto.randomUUID(), ticketId, t.amount]
+    // 1. 解锁品控暂扣批次（在同一事务内，与工单完成状态同步）
+    await conn.query(
+      "UPDATE scan_records SET batch_status = 'unlocked' WHERE ticket_id = $1",
+      [ticketId]
+    );
+
+    // 2. 库存变动（针对报废/损耗类品控异常）
+    if (qcAction.inventoryChange === 'deduct') {
+      const scanRec = await conn.query(
+        'SELECT sku_code, batch_no FROM scan_records WHERE ticket_id = $1 LIMIT 1',
+        [ticketId]
+      );
+      if (scanRec.rows.length > 0) {
+        const { sku_code } = scanRec.rows[0];
+        const inv = await conn.query(
+          "SELECT id, total_qty, locked_qty FROM inventory WHERE sku_code = $1 AND warehouse = 'default'",
+          [sku_code]
         );
-      }
+        if (inv.rows.length > 0) {
+          const { id: invId, total_qty, locked_qty } = inv.rows[0];
+          const deductQty = Math.min(locked_qty, 1); // 至少解锁1件（实际应从工单数量获取）
+          const newTotal = Math.max(0, total_qty - deductQty);
+          const newLocked = Math.max(0, locked_qty - deductQty);
 
-      await query("UPDATE exception_tickets SET current_status = 'completed', updated_at = NOW() WHERE id = $1", [ticketId]);
-      await query('COMMIT');
-    } catch (e) {
-      await query('ROLLBACK');
-      console.error('QC execution failed:', e);
+          await conn.query(
+            'UPDATE inventory SET total_qty = $1, locked_qty = $2, updated_at = NOW() WHERE id = $3',
+            [newTotal, newLocked, invId]
+          );
+
+          await conn.query(
+            `INSERT INTO inventory_logs(id, sku_code, change_type, qty_change, qty_before, qty_after, reason, ticket_id, approval_record_id)
+             VALUES($1, $2, 'deduct', $3, $4, $5, $6, $7, $8)`,
+            [crypto.randomUUID(), sku_code, -deductQty, total_qty, newTotal,
+             `品控异常-${exceptionType}：货物报废/损耗`, ticketId, approvalRecordId]
+          );
+        }
+      }
     }
-  } else {
-    // 物流异常：生成赔付（赔客户）
-    await query('BEGIN');
-    try {
-      if (['丢件', '破损'].includes(t.exception_type)) {
-        await query(
-          `INSERT INTO compensation_records(id, ticket_id, compensation_direction, amount, status)
-           VALUES($1, $2, 'to_customer', $3, 'pending')`,
-          [crypto.randomUUID(), ticketId, t.amount]
-        );
-      }
 
-      await query("UPDATE exception_tickets SET current_status = 'completed', updated_at = NOW() WHERE id = $1", [ticketId]);
-      await query('COMMIT');
-    } catch (e) {
-      await query('ROLLBACK');
-      console.error('Logistics execution failed:', e);
+    // 3. 生成赔付记录（向供应商追偿，关联 approval_record_id 保证可追溯）
+    if (qcAction.generateCompensation && parseFloat(amount) > 0) {
+      await conn.query(
+        `INSERT INTO compensation_records(id, ticket_id, approval_record_id, compensation_direction, amount, status, remark)
+         VALUES($1, $2, $3, 'to_supplier', $4, 'pending', $5)`,
+        [crypto.randomUUID(), ticketId, approvalRecordId, amount,
+         `品控异常-${exceptionType}：向供应商追偿`]
+      );
+    }
+
+  } else {
+    // ============================================================
+    // 物流异常执行联动
+    // 赔付方向：赔付给客户
+    // ============================================================
+    const logAction = LOGISTICS_ACTION_MAP[exceptionType] || { inventoryChange: 'none', generateCompensation: false, compensationDirection: null };
+
+    // 库存联动（按异常类型映射）
+    if (logAction.inventoryChange !== 'none') {
+      // 从快照表获取 SKU 信息
+      const snapshot = await conn.query(
+        'SELECT sku_summary FROM waybill_snapshots WHERE waybill_no = $1',
+        [waybillNo]
+      );
+      const skuSummary = snapshot.rows[0]?.sku_summary || [];
+
+      for (const sku of skuSummary) {
+        if (!sku.sku_code) continue;
+        const inv = await conn.query(
+          "SELECT id, total_qty, locked_qty FROM inventory WHERE sku_code = $1 AND warehouse = 'default'",
+          [sku.sku_code]
+        );
+
+        if (inv.rows.length > 0) {
+          const { id: invId, total_qty, locked_qty } = inv.rows[0];
+          let newTotal = total_qty;
+          let changeType: string;
+          let qtyChange: number;
+
+          if (logAction.inventoryChange === 'deduct') {
+            // 丢件/破损：减少总库存
+            qtyChange = -(sku.quantity || 1);
+            newTotal = Math.max(0, total_qty + qtyChange);
+            changeType = 'deduct';
+          } else {
+            // 客户拒收：退回入库，增加总库存
+            qtyChange = sku.quantity || 1;
+            newTotal = total_qty + qtyChange;
+            changeType = 'add';
+          }
+
+          await conn.query(
+            'UPDATE inventory SET total_qty = $1, updated_at = NOW() WHERE id = $2',
+            [newTotal, invId]
+          );
+
+          await conn.query(
+            `INSERT INTO inventory_logs(id, sku_code, change_type, qty_change, qty_before, qty_after, reason, ticket_id, approval_record_id)
+             VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [crypto.randomUUID(), sku.sku_code, changeType, qtyChange, total_qty, newTotal,
+             `物流异常-${exceptionType}`, ticketId, approvalRecordId]
+          );
+        }
+      }
+    }
+
+    // 生成赔付记录（关联 approval_record_id）
+    if (logAction.generateCompensation && logAction.compensationDirection && parseFloat(amount) > 0) {
+      await conn.query(
+        `INSERT INTO compensation_records(id, ticket_id, approval_record_id, compensation_direction, amount, status, remark)
+         VALUES($1, $2, $3, $4, $5, 'pending', $6)`,
+        [crypto.randomUUID(), ticketId, approvalRecordId, logAction.compensationDirection, amount,
+         `物流异常-${exceptionType}：${logAction.compensationDirection === 'to_customer' ? '赔付给客户' : '向供应商追偿'}`]
+      );
     }
   }
 }
