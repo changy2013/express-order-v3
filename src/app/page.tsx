@@ -3,11 +3,12 @@
 import { useEffect, useState } from 'react';
 
 interface Stats {
-  pendingCount: number;
-  todayNewCount: number;
-  nearTimeoutCount: number;
-  totalCompensationAmount: number;
-  byStatus: Array<{ current_status: string; count: string }>;
+  pendingCount?: number;
+  todayNewCount?: number;
+  nearTimeoutCount?: number;
+  totalCompensationAmount?: number;
+  byStatus?: Array<{ current_status: string; count: string }>;
+  error?: string;
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -25,10 +26,29 @@ export default function Home() {
 
   useEffect(() => {
     fetch('/api/tickets?stats=true')
-      .then(r => r.json())
-      .then(d => { setStats(d); setLoading(false); })
-      .catch(() => setLoading(false));
+      .then(r => {
+        if (!r.ok) {
+          // If status is 500 or other error, handle it gracefully
+          return r.json().catch(() => ({ error: `HTTP error ${r.status}` }));
+        }
+        return r.json();
+      })
+      .then(d => {
+        setStats(d);
+        setLoading(false);
+      })
+      .catch((err) => {
+        setStats({ error: err.message || '网络连接失败' });
+        setLoading(false);
+      });
   }, []);
+
+  const hasError = !!stats?.error;
+  const pendingCount = stats?.pendingCount ?? 0;
+  const todayNewCount = stats?.todayNewCount ?? 0;
+  const nearTimeoutCount = stats?.nearTimeoutCount ?? 0;
+  const totalCompensationAmount = stats?.totalCompensationAmount ?? 0;
+  const byStatus = stats?.byStatus ?? [];
 
   const statCards = [
     {
@@ -89,8 +109,30 @@ export default function Home() {
           扫描品控 · 异常上报 · 分级审批 · 执行联动 — 运单全生命周期管理
         </p>
 
+        {/* 数据库/环境初始化异常提示 */}
+        {!loading && hasError && (
+          <div style={{
+            background: '#fff2f0',
+            border: '1px solid #ffccc7',
+            borderRadius: 8,
+            padding: '16px 20px',
+            marginBottom: 24,
+            color: '#cf1322',
+            fontSize: 14,
+            lineHeight: 1.5,
+          }}>
+            <p style={{ fontWeight: 600, margin: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
+              ⚠️ 系统初始化或数据库连接未就绪
+            </p>
+            <p style={{ margin: '8px 0 0 0', fontSize: 13, color: '#434343' }}>
+              错误信息: {stats?.error}. <br />
+              请确保 Vercel 环境已正确配置 <code>DATABASE_URL</code>, 并执行了 <code>db/init.sql</code> 初始化表结构。
+            </p>
+          </div>
+        )}
+
         {/* 实时统计区域 */}
-        {!loading && stats && (
+        {!loading && !hasError && stats && (
           <div style={{
             display: 'grid',
             gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
@@ -98,20 +140,20 @@ export default function Home() {
             marginBottom: 32,
           }}>
             <div className="card" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: 28, fontWeight: 700, color: '#0fc6c2' }}>{stats.pendingCount}</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: '#0fc6c2' }}>{pendingCount}</div>
               <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>⏳ 待审批工单</div>
             </div>
             <div className="card" style={{ padding: '16px 20px' }}>
-              <div style={{ fontSize: 28, fontWeight: 700, color: '#185fa5' }}>{stats.todayNewCount}</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: '#185fa5' }}>{todayNewCount}</div>
               <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>📅 今日新增工单</div>
             </div>
             <div className="card" style={{
               padding: '16px 20px',
-              background: stats.nearTimeoutCount > 0 ? 'rgba(250, 173, 20, 0.08)' : undefined,
-              border: stats.nearTimeoutCount > 0 ? '1px solid #fa8c16' : undefined,
+              background: nearTimeoutCount > 0 ? 'rgba(250, 173, 20, 0.08)' : undefined,
+              border: nearTimeoutCount > 0 ? '1px solid #fa8c16' : undefined,
             }}>
-              <div style={{ fontSize: 28, fontWeight: 700, color: stats.nearTimeoutCount > 0 ? '#fa8c16' : '#595959' }}>
-                {stats.nearTimeoutCount}
+              <div style={{ fontSize: 28, fontWeight: 700, color: nearTimeoutCount > 0 ? '#fa8c16' : '#595959' }}>
+                {nearTimeoutCount}
               </div>
               <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>
                 ⚠️ 即将超时工单
@@ -119,7 +161,7 @@ export default function Home() {
             </div>
             <div className="card" style={{ padding: '16px 20px' }}>
               <div style={{ fontSize: 22, fontWeight: 700, color: '#cf1322' }}>
-                ¥{stats.totalCompensationAmount.toLocaleString('zh-CN', { minimumFractionDigits: 0 })}
+                ¥{totalCompensationAmount.toLocaleString('zh-CN', { minimumFractionDigits: 0 })}
               </div>
               <div style={{ fontSize: 13, color: '#666', marginTop: 4 }}>💰 赔付总额</div>
             </div>
@@ -127,11 +169,11 @@ export default function Home() {
         )}
 
         {/* 工单状态分布 */}
-        {!loading && stats?.byStatus && stats.byStatus.length > 0 && (
+        {!loading && !hasError && byStatus.length > 0 && (
           <div className="card" style={{ marginBottom: 28, padding: '16px 20px' }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: '#666' }}>工单状态分布</div>
             <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              {stats.byStatus.map(s => (
+              {byStatus.map(s => (
                 <a
                   key={s.current_status}
                   href={`/tickets?status=${s.current_status}`}
