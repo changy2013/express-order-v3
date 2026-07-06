@@ -47,7 +47,7 @@ export class V2Client {
     const start = Date.now();
     try {
       const res = await fetchWithRetry(
-        `${V2_BASE}/api/orders?q_code=${encodeURIComponent(waybillNo)}&pageSize=1`
+        `${V2_BASE}/api/v2/waybills/${encodeURIComponent(waybillNo)}`
       );
       const duration = Date.now() - start;
       const body = await res.json();
@@ -59,27 +59,7 @@ export class V2Client {
       });
 
       if (!res.ok) return { error: body.error || '运单查询失败' };
-
-      // 从 V2 响应格式中提取数据
-      const groups = body.groups || [];
-      const match = groups.find((g: any) => g['外部编码'] === waybillNo);
-      if (!match) return { error: '运单不存在' };
-
-      const data: V2WaybillDetail = {
-        waybill_no: match['外部编码'],
-        receiver_name: match['收件人姓名'],
-        receiver_phone: match['收件人电话'],
-        receiver_address: match['收件人地址'],
-        total_amount: parseFloat(match.total_amount || '0'),
-        status: 'active',
-        sku_items: (match.sku_items || []).map((s: any) => ({
-          sku_code: s.sku_code,
-          sku_name: s.sku_name,
-          quantity: s.sku_quantity || 1,
-        })),
-        updated_at: match.created_at,
-      };
-      return { data };
+      return { data: body as V2WaybillDetail };
     } catch (err: any) {
       const duration = Date.now() - start;
       await logSyncCall({
@@ -98,7 +78,7 @@ export class V2Client {
     const start = Date.now();
     try {
       const res = await fetchWithRetry(
-        `${V2_BASE}/api/orders?q_code=${encodeURIComponent(waybillNo)}&pageSize=1`
+        `${V2_BASE}/api/v2/waybills/${encodeURIComponent(waybillNo)}/skus/${encodeURIComponent(skuCode)}`
       );
       const duration = Date.now() - start;
       const body = await res.json();
@@ -110,24 +90,7 @@ export class V2Client {
       });
 
       if (!res.ok) return { error: body.error || 'SKU 校验失败' };
-
-      // 检查组内是否有该 SKU
-      const groups = body.groups || [];
-      const match = groups.find((g: any) => g['外部编码'] === waybillNo);
-      if (!match) return { error: '运单不存在' };
-
-      const skuItems = match.sku_items || [];
-      const skuMatch = skuItems.find((s: any) => s.sku_code === skuCode);
-
-      return {
-        data: {
-          exists: !!skuMatch,
-          sku_code: skuCode,
-          sku_name: skuMatch?.sku_name,
-          quantity: skuMatch?.sku_quantity || 0,
-          waybill_no: waybillNo,
-        },
-      };
+      return { data: body as V2SkuVerifyResult };
     } catch (err: any) {
       const duration = Date.now() - start;
       await logSyncCall({
@@ -145,7 +108,7 @@ export class V2Client {
     const requestId = crypto.randomUUID();
     const start = Date.now();
     try {
-      const res = await fetchWithRetry(`${V2_BASE}/api/orders?pageSize=200`);
+      const res = await fetchWithRetry(`${V2_BASE}/api/v2/waybills?pageSize=200`);
       const duration = Date.now() - start;
       const body = await res.json();
 
@@ -157,16 +120,15 @@ export class V2Client {
 
       if (!res.ok) return { count: 0, error: body.error };
 
-      const waybills = body.groups || [];
+      const waybills = body.waybills || [];
       let count = 0;
       for (const wb of waybills) {
-        const waybillNo = wb['外部编码'];
-        if (!waybillNo) continue;
+        if (!wb.waybill_no) continue;
 
         const skuSummary = (wb.sku_items || []).map((s: any) => ({
           sku_code: s.sku_code,
           sku_name: s.sku_name,
-          quantity: s.sku_quantity || 1,
+          quantity: s.quantity || 1,
         }));
 
         await query(
@@ -181,11 +143,11 @@ export class V2Client {
              last_synced_at = NOW()`,
           [
             crypto.randomUUID(),
-            waybillNo,
-            wb['收件人姓名'] || null,
-            wb['收件人电话'] || null,
-            wb['收件人地址'] || null,
-            parseFloat(wb.total_amount || '0'),
+            wb.waybill_no,
+            wb.receiver_name || null,
+            wb.receiver_phone || null,
+            wb.receiver_address || null,
+            Number(wb.total_amount || 0),
             JSON.stringify(skuSummary),
           ]
         );
