@@ -169,7 +169,7 @@ export async function POST(req: NextRequest) {
 
       // 乐观锁更新工单状态（version 字段防并发冲突）
       const updateResult = await conn.query(
-        `UPDATE exception_tickets 
+        `UPDATE exception_tickets
          SET current_status = $1, version = version + 1, updated_at = NOW()
          WHERE id = $2 AND version = $3`,
         [newStatus, ticket_id, t.version]
@@ -216,6 +216,82 @@ export async function POST(req: NextRequest) {
   }
 }
 
+async function getQcReleaseContext(conn: any, ticketId: string) {
+  const scanRec = await conn.query(
+    'SELECT sku_code FROM scan_records WHERE ticket_id = $1 ORDER BY scanned_at LIMIT 1',
+    [ticketId]
+  );
+  const skuCode = scanRec.rows[0]?.sku_code;
+  if (!skuCode) return null;
+
+  const lockLog = await conn.query(
+    `SELECT COALESCE(SUM(qty_change), 0) AS locked_qty
+     FROM inventory_logs
+     WHERE ticket_id = $1 AND change_type = 'lock'`,
+    [ticketId]
+  );
+  const releaseQty = Number(lockLog.rows[0]?.locked_qty || 0);
+
+  return { skuCode, releaseQty };
+}
+
+async function releaseQcInventoryLock(
+  conn: any,
+  params: {
+    ticketId: string;
+    approvalRecordId?: string;
+    reason: string;
+  }
+) {
+  const releaseContext = await getQcReleaseContext(conn, params.ticketId);
+  if (!releaseContext?.skuCode || releaseContext.releaseQty <= 0) {
+    return null;
+  }
+
+  const inv = await conn.query(
+    "SELECT id, total_qty, locked_qty FROM inventory WHERE sku_code = $1 AND warehouse = 'default'",
+    [releaseContext.skuCode]
+  );
+  if (inv.rows.length === 0) {
+    return null;
+  }
+
+  const { id: invId, total_qty, locked_qty } = inv.rows[0];
+  const actualReleaseQty = Math.min(Number(locked_qty || 0), releaseContext.releaseQty);
+  if (actualReleaseQty <= 0) {
+    return null;
+  }
+
+  const newLocked = Math.max(0, Number(locked_qty || 0) - actualReleaseQty);
+  await conn.query(
+    'UPDATE inventory SET locked_qty = $1, updated_at = NOW() WHERE id = $2',
+    [newLocked, invId]
+  );
+
+  await conn.query(
+    `INSERT INTO inventory_logs(id, sku_code, change_type, qty_change, qty_before, qty_after, reason, ticket_id, approval_record_id)
+     VALUES($1, $2, 'unlock', $3, $4, $5, $6, $7, $8)`,
+    [
+      crypto.randomUUID(),
+      releaseContext.skuCode,
+      -actualReleaseQty,
+      locked_qty,
+      newLocked,
+      params.reason,
+      params.ticketId,
+      params.approvalRecordId || null,
+    ]
+  );
+
+  return {
+    skuCode: releaseContext.skuCode,
+    actualReleaseQty,
+    totalQty: Number(total_qty || 0),
+    lockedQty: Number(locked_qty || 0),
+    newLocked,
+  };
+}
+
 /**
  * 在事务连接内执行联动动作（库存 + 赔付 + 批次解锁）
  * 必须在同一事务内完成，任何步骤失败均回滚，防止中间态
@@ -240,40 +316,31 @@ async function executeInTransaction(
       [ticketId]
     );
 
-    // 2. 库存变动（针对报废/损耗类品控异常）
-    if (qcAction.inventoryChange === 'deduct') {
-      const scanRec = await conn.query(
-        'SELECT sku_code, batch_no FROM scan_records WHERE ticket_id = $1 LIMIT 1',
-        [ticketId]
+    // 2. 统一释放库存锁，避免批次已解锁但 locked_qty 残留
+    const released = await releaseQcInventoryLock(conn, {
+      ticketId,
+      approvalRecordId,
+      reason: `品控工单完成解锁：${exceptionType}`,
+    });
+
+    // 3. 库存变动（针对报废/损耗类品控异常）
+    if (qcAction.inventoryChange === 'deduct' && released) {
+      const newTotal = Math.max(0, released.totalQty - released.actualReleaseQty);
+
+      await conn.query(
+        'UPDATE inventory SET total_qty = $1, updated_at = NOW() WHERE sku_code = $2 AND warehouse = $3',
+        [newTotal, released.skuCode, 'default']
       );
-      if (scanRec.rows.length > 0) {
-        const { sku_code } = scanRec.rows[0];
-        const inv = await conn.query(
-          "SELECT id, total_qty, locked_qty FROM inventory WHERE sku_code = $1 AND warehouse = 'default'",
-          [sku_code]
-        );
-        if (inv.rows.length > 0) {
-          const { id: invId, total_qty, locked_qty } = inv.rows[0];
-          const deductQty = Math.min(locked_qty, 1); // 至少解锁1件（实际应从工单数量获取）
-          const newTotal = Math.max(0, total_qty - deductQty);
-          const newLocked = Math.max(0, locked_qty - deductQty);
 
-          await conn.query(
-            'UPDATE inventory SET total_qty = $1, locked_qty = $2, updated_at = NOW() WHERE id = $3',
-            [newTotal, newLocked, invId]
-          );
-
-          await conn.query(
-            `INSERT INTO inventory_logs(id, sku_code, change_type, qty_change, qty_before, qty_after, reason, ticket_id, approval_record_id)
-             VALUES($1, $2, 'deduct', $3, $4, $5, $6, $7, $8)`,
-            [crypto.randomUUID(), sku_code, -deductQty, total_qty, newTotal,
-             `品控异常-${exceptionType}：货物报废/损耗`, ticketId, approvalRecordId]
-          );
-        }
-      }
+      await conn.query(
+        `INSERT INTO inventory_logs(id, sku_code, change_type, qty_change, qty_before, qty_after, reason, ticket_id, approval_record_id)
+         VALUES($1, $2, 'deduct', $3, $4, $5, $6, $7, $8)`,
+        [crypto.randomUUID(), released.skuCode, -released.actualReleaseQty, released.totalQty, newTotal,
+         `品控异常-${exceptionType}：货物报废/损耗`, ticketId, approvalRecordId]
+      );
     }
 
-    // 3. 生成赔付记录（向供应商追偿，关联 approval_record_id 保证可追溯）
+    // 4. 生成赔付记录（向供应商追偿，关联 approval_record_id 保证可追溯）
     if (qcAction.generateCompensation && parseFloat(amount) > 0) {
       await conn.query(
         `INSERT INTO compensation_records(id, ticket_id, approval_record_id, compensation_direction, amount, status, remark)
@@ -307,7 +374,7 @@ async function executeInTransaction(
         );
 
         if (inv.rows.length > 0) {
-          const { id: invId, total_qty, locked_qty } = inv.rows[0];
+          const { id: invId, total_qty } = inv.rows[0];
           let newTotal = total_qty;
           let changeType: string;
           let qtyChange: number;

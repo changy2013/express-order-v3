@@ -5,6 +5,21 @@ import { useParams } from 'next/navigation';
 import StatusBadge from '@/components/common/StatusBadge';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
 
+function getApprovalLevelLabel(level: string) {
+  if (level === 'level1') return '一级';
+  if (level === 'level2') return '二级';
+  if (level === 'qc_supervisor') return '品控主管';
+  return level;
+}
+
+function getApprovalActionDisplay(action: string) {
+  if (action === 'approved') return { label: '通过', className: 'tag-success' };
+  if (action === 'rejected') return { label: '拒绝', className: 'tag-error' };
+  if (action === 'transferred') return { label: '转交', className: 'tag-info' };
+  if (action === 'quick_released') return { label: '快速放行', className: 'tag-warning' };
+  return { label: action, className: 'tag-info' };
+}
+
 export default function TicketDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<any>(null);
@@ -96,25 +111,22 @@ export default function TicketDetailPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {detail.approvals.map((a: any) => (
-                      <tr key={a.id}>
-                        <td>{a.approver}</td>
-                        <td>{a.approval_level === 'level1' ? '一级' : '二级'}</td>
-                        <td>
-                          <span className={`tag ${
-                            a.action === 'approved' ? 'tag-success' :
-                            a.action === 'rejected' ? 'tag-error' :
-                            'tag-info'
-                          }`}>
-                            {a.action === 'approved' ? '通过' :
-                             a.action === 'rejected' ? '拒绝' :
-                             a.action === 'transferred' ? '转交' : a.action}
-                          </span>
-                        </td>
-                        <td>{a.comment || '-'}</td>
-                        <td style={{ fontSize: 12 }}>{new Date(a.created_at).toLocaleString('zh-CN')}</td>
-                      </tr>
-                    ))}
+                    {detail.approvals.map((a: any) => {
+                      const actionDisplay = getApprovalActionDisplay(a.action);
+                      return (
+                        <tr key={a.id}>
+                          <td>{a.approver}</td>
+                          <td>{getApprovalLevelLabel(a.approval_level)}</td>
+                          <td>
+                            <span className={`tag ${actionDisplay.className}`}>
+                              {actionDisplay.label}
+                            </span>
+                          </td>
+                          <td>{a.comment || '-'}</td>
+                          <td style={{ fontSize: 12 }}>{new Date(a.created_at).toLocaleString('zh-CN')}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -135,6 +147,41 @@ export default function TicketDetailPage() {
                   {c.settlement_method && <span><strong>结算方式:</strong> {c.settlement_method}</span>}
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* 库存流水 */}
+          {detail.inventoryLogs?.length > 0 && (
+            <div style={{ border: '1px solid var(--color-border-light)', borderRadius: 8, padding: 16 }}>
+              <h3 style={{ marginBottom: 12 }}>📦 库存流水</h3>
+              <div className="table-wrapper">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>SKU</th>
+                      <th>变更类型</th>
+                      <th>变更数量</th>
+                      <th>变更前</th>
+                      <th>变更后</th>
+                      <th>原因</th>
+                      <th>时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detail.inventoryLogs.map((log: any) => (
+                      <tr key={log.id}>
+                        <td>{log.sku_code}</td>
+                        <td><span className="tag tag-info">{log.change_type}</span></td>
+                        <td>{log.qty_change}</td>
+                        <td>{log.qty_before}</td>
+                        <td>{log.qty_after}</td>
+                        <td>{log.reason || '-'}</td>
+                        <td style={{ fontSize: 12 }}>{new Date(log.created_at).toLocaleString('zh-CN')}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 

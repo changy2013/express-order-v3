@@ -5,6 +5,9 @@ export interface QcResult {
   passed: boolean;
   ruleId?: string;
   ruleName?: string;
+  exceptionType?: string;
+  severity?: string;
+  targetApprovalLevel?: 'level1' | 'level2';
   detail: string;
 }
 
@@ -26,15 +29,21 @@ export class QCEngine {
 
     for (const rule of rules.rows) {
       const conditions = rule.trigger_conditions;
+      const baseResult = {
+        passed: false as const,
+        ruleId: rule.id,
+        ruleName: rule.name,
+        exceptionType: rule.exception_type,
+        severity: rule.severity,
+        targetApprovalLevel: (rule.target_approval_level === 'level1' ? 'level1' : 'level2') as 'level1' | 'level2',
+      };
 
       // 数量差异检测
       if (conditions.qty_diff_percent !== undefined && params.expectedQty > 0) {
         const diffPercent = Math.abs(params.scannedQty - params.expectedQty) / params.expectedQty * 100;
         if (diffPercent >= conditions.qty_diff_percent) {
           return {
-            passed: false,
-            ruleId: rule.id,
-            ruleName: rule.name,
+            ...baseResult,
             detail: `数量差异 ${diffPercent.toFixed(1)}% (预期${params.expectedQty}, 实际${params.scannedQty}), 阈值 ${conditions.qty_diff_percent}%`,
           };
         }
@@ -43,9 +52,7 @@ export class QCEngine {
       // 破损等级检测
       if (conditions.damage_level !== undefined && (params.damageLevel || 0) >= conditions.damage_level) {
         return {
-          passed: false,
-          ruleId: rule.id,
-          ruleName: rule.name,
+          ...baseResult,
           detail: `破损等级 ${params.damageLevel}, 阈值 ${conditions.damage_level}`,
         };
       }
@@ -53,9 +60,7 @@ export class QCEngine {
       // 规格不符检测
       if (conditions.spec_mismatch && params.specMatch === false) {
         return {
-          passed: false,
-          ruleId: rule.id,
-          ruleName: rule.name,
+          ...baseResult,
           detail: '规格不匹配',
         };
       }
@@ -63,9 +68,7 @@ export class QCEngine {
       // 批次异常检测
       if (conditions.batch_check && params.batchNo === undefined) {
         return {
-          passed: false,
-          ruleId: rule.id,
-          ruleName: rule.name,
+          ...baseResult,
           detail: '批次号缺失',
         };
       }
@@ -80,10 +83,10 @@ export class QCEngine {
    */
   static async checkOpenTicket(waybillNo: string, skuCode: string, batchNo?: string): Promise<{ hasOpen: boolean; ticketId?: string }> {
     const r = await query(
-      `SELECT sr.ticket_id, et.current_status 
+      `SELECT sr.ticket_id, et.current_status
        FROM scan_records sr
        JOIN exception_tickets et ON sr.ticket_id = et.id
-       WHERE sr.waybill_no = $1 AND sr.sku_code = $2 
+       WHERE sr.waybill_no = $1 AND sr.sku_code = $2
          AND ($3::varchar IS NULL OR sr.batch_no = $3)
          AND et.current_status NOT IN ('completed', 'closed')
        ORDER BY sr.scanned_at DESC LIMIT 1`,

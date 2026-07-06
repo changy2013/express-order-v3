@@ -65,6 +65,10 @@ export async function POST(req: NextRequest) {
     const scanId = crypto.randomUUID();
     const ticketId = crypto.randomUUID();
     const ticketNo = `QC${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    const targetLevel = qcResult.targetApprovalLevel || 'level2';
+    const initialStatus = targetLevel === 'level1' ? 'level1_approving' : 'level2_approving';
+    const severity = qcResult.severity || 'high';
+    const exceptionType = qcResult.exceptionType || qcResult.ruleName || '品控异常';
 
     try {
       await conn.query('BEGIN');
@@ -107,18 +111,19 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // 创建异常工单（来源标记 = 'scan'，状态直接进入 level2_approving）
-      // 题目要求：品控工单自动创建时直接进入二级审批
+      // 创建异常工单（来源标记 = 'scan'，审批层级和严重度由命中规则驱动）
       await conn.query(
         `INSERT INTO exception_tickets(id, ticket_no, waybill_no, source, exception_type, severity, description, reported_by, current_status, approval_level, amount)
-         VALUES($1, $2, $3, 'scan', $4, $5, $6, $7, 'level2_approving', 'level2', $8)`,
+         VALUES($1, $2, $3, 'scan', $4, $5, $6, $7, $8, $9, $10)`,
         [
           ticketId, ticketNo, waybill_no,
-          qcResult.ruleName || '品控异常',
-          'high', // 品控工单默认高严重度（直接影响货物出库）
+          exceptionType,
+          severity,
           qcResult.detail,
           operator,
-          skuResult.data?.quantity ? skuResult.data.quantity * 100 : 0, // 估算金额
+          initialStatus,
+          targetLevel,
+          skuResult.data?.quantity ? skuResult.data.quantity * 100 : 0,
         ]
       );
 
@@ -131,7 +136,9 @@ export async function POST(req: NextRequest) {
         detail: qcResult.detail,
         ruleId: qcResult.ruleId,
         ruleName: qcResult.ruleName,
-        status: 'level2_approving', // 告知前端：品控工单直接进入二级审批
+        severity,
+        targetApprovalLevel: targetLevel,
+        status: initialStatus,
       });
     } catch (err) {
       await conn.query('ROLLBACK');

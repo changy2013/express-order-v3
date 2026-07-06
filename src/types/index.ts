@@ -97,8 +97,8 @@ export interface ApprovalRecord {
   id: string;
   ticket_id: string;
   approver: string;
-  approval_level: string;
-  action: 'approved' | 'rejected' | 'escalated' | 'transferred';
+  approval_level: 'level1' | 'level2' | 'qc_supervisor' | string;
+  action: 'approved' | 'rejected' | 'escalated' | 'transferred' | 'quick_released';
   comment?: string;
   operation_token: string;
   created_at: string;
